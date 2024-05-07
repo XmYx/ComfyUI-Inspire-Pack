@@ -1,9 +1,13 @@
 import itertools
 from typing import Optional
+
+import matplotlib.pyplot
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
 import math
+
+from matplotlib import pyplot as plt
 
 
 def apply_variation_noise(latent_image, noise_device, variation_seed, variation_strength, mask=None):
@@ -30,119 +34,170 @@ def apply_variation_noise(latent_image, noise_device, variation_seed, variation_
         result = (mask == 1).float() * ((1 - variation_strength) * latent_image + variation_strength * variation_noise * mask) + (mask == 0).float() * latent_image
 
     return result
+# from https://discuss.pytorch.org/t/help-regarding-slerp-function-for-generative-model-sampling/32475/3
+def slerp(val, low, high):
+    low_norm = low / torch.norm(low, dim=1, keepdim=True)
+    high_norm = high / torch.norm(high, dim=1, keepdim=True)
+    dot = (low_norm * high_norm).sum(1)
 
+    if dot.mean() > 0.9995:
+        return low * val + high * (1 - val)
 
+    omega = torch.acos(dot)
+    so = torch.sin(omega)
+    res = (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (torch.sin(val * omega) / so).unsqueeze(1) * high
+    return res
+class Latent2RGBPreviewer:
+    def __init__(self):
+        self.scale_factor = 0.13025
+        self.latent_rgb_factors = [
+                    #   R        G        B
+                    [ 0.3920,  0.4054,  0.4549],
+                    [-0.2634, -0.0196,  0.0653],
+                    [ 0.0568,  0.1687, -0.0755],
+                    [-0.3112, -0.2359, -0.2076]
+                ]
+        self.latent_rgb_factors = torch.tensor(self.latent_rgb_factors, device="cpu")
+
+    def decode_latent_to_preview(self, x0):
+        latent_image = x0[0].permute(1, 2, 0).cpu() @ self.latent_rgb_factors
+
+        latents_ubyte = (((latent_image + 1) / 2)
+                            .clamp(0, 1)  # change scale from -1..1 to 0..1
+                            .mul(0xFF)  # to 0..255
+                            .byte()).cpu()
+
+        return Image.fromarray(latents_ubyte.numpy())
 def prepare_noise(latent_image, seed, noise_inds=None, noise_device="cpu", incremental_seed_mode="comfy", variation_seed=None, variation_strength=None):
     """
     creates random noise given a latent image and a seed.
     optional arg skip can be used to skip and discard x number of noise generations for a given seed
     """
-
     latent_size = latent_image.size()
     latent_size_1batch = [1, latent_size[1], latent_size[2], latent_size[3]]
 
-    if variation_strength is not None and variation_strength > 0 or incremental_seed_mode.startswith("variation str inc"):
-        if noise_device == "cpu":
-            variation_generator = torch.manual_seed(variation_seed)
-        else:
-            torch.cuda.manual_seed(variation_seed)
-            variation_generator = None
+    # # if variation_strength is not None and variation_strength > 0 or incremental_seed_mode.startswith("variation str inc"):
+    # if noise_device == "cpu":
+    #     variation_generator = torch.manual_seed(variation_seed)
+    # else:
+    #     torch.cuda.manual_seed(variation_seed)
+    #     variation_generator = None
 
-        variation_latent = torch.randn(latent_size_1batch, dtype=latent_image.dtype, layout=latent_image.layout,
-                                       generator=variation_generator, device=noise_device)
-    else:
-        variation_latent = None
-
-    def apply_variation(input_latent, strength_up=None):
-        if variation_latent is None:
-            return input_latent
-        else:
-            strength = variation_strength
-
-            if strength_up is not None:
-                strength += strength_up
-
-            variation_noise = variation_latent.expand(input_latent.size()[0], -1, -1, -1)
-            mixed_noise = (1 - strength) * input_latent + strength * variation_noise
-
-            # NOTE: Since the variance of the Gaussian noise in mixed_noise has changed, it must be corrected through scaling.
-            scale_factor = math.sqrt((1 - strength) ** 2 + strength ** 2)
-            corrected_noise = mixed_noise / scale_factor
-
-            return corrected_noise
-
-    # method: incremental seed batch noise
-    if noise_inds is None and incremental_seed_mode == "incremental":
-        batch_cnt = latent_size[0]
-
-        latents = None
-        for i in range(batch_cnt):
-            if noise_device == "cpu":
-                generator = torch.manual_seed(seed+i)
-            else:
-                torch.cuda.manual_seed(seed+i)
-                generator = None
-
-            latent = torch.randn(latent_size_1batch, dtype=latent_image.dtype, layout=latent_image.layout,
-                                 generator=generator, device=noise_device)
-
-            latent = apply_variation(latent)
-
-            if latents is None:
-                latents = latent
-            else:
-                latents = torch.cat((latents, latent), dim=0)
-
-        return latents
-
-    # method: incremental variation batch noise
-    elif noise_inds is None and incremental_seed_mode.startswith("variation str inc"):
-        batch_cnt = latent_size[0]
-
-        latents = None
-        for i in range(batch_cnt):
-            if noise_device == "cpu":
-                generator = torch.manual_seed(seed)
-            else:
-                torch.cuda.manual_seed(seed)
-                generator = None
-
-            latent = torch.randn(latent_size_1batch, dtype=latent_image.dtype, layout=latent_image.layout,
-                                 generator=generator, device=noise_device)
-
-            step = float(incremental_seed_mode[18:])
-            latent = apply_variation(latent, step*i)
-
-            if latents is None:
-                latents = latent
-            else:
-                latents = torch.cat((latents, latent), dim=0)
-
-        return latents
-
-    # method: comfy batch noise
-    if noise_device == "cpu":
-        generator = torch.manual_seed(seed)
-    else:
-        torch.cuda.manual_seed(seed)
-        generator = None
-
-    if noise_inds is None:
-        latents = torch.randn(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout,
-                              generator=generator, device=noise_device)
-        latents = apply_variation(latents)
-        return latents
-
-    unique_inds, inverse = np.unique(noise_inds, return_inverse=True)
-    noises = []
-    for i in range(unique_inds[-1] + 1):
-        noise = torch.randn([1] + list(latent_image.size())[1:], dtype=latent_image.dtype, layout=latent_image.layout,
-                            generator=generator, device=noise_device)
-        if i in unique_inds:
-            noises.append(noise)
-    noises = [noises[i] for i in inverse]
-    noises = torch.cat(noises, axis=0)
-    return noises
+    # variation_latent = torch.randn(latent_size_1batch, dtype=latent_image.dtype, layout=latent_image.layout,
+    #                                generator=variation_generator, device=noise_device)
+    from .rng_noise_generator import ImageRNGNoise
+    rng = ImageRNGNoise(shape=latent_image[0].shape, seeds=[seed], subseeds=[variation_seed], subseed_strength=variation_strength,
+                             seed_resize_from_h=1024, seed_resize_from_w=1024)
+    variation_latent = rng.first()
+    return variation_latent
+    # else:
+    #     variation_latent = None
+    #
+    # def apply_variation(input_latent, strength_up=None):
+    #
+    #     if variation_latent is None:
+    #         return input_latent
+    #     else:
+    #         strength = variation_strength
+    #
+    #         if strength_up is not None:
+    #             strength += strength_up
+    #
+    #         variation_noise = variation_latent.expand(input_latent.size()[0], -1, -1, -1)
+    #         #mixed_noise = (1 - strength) * input_latent + strength * variation_noise
+    #         mixed_noise = slerp(strength, variation_noise, input_latent)
+    #         decoder = Latent2RGBPreviewer()
+    #         noise_img = decoder.decode_latent_to_preview(input_latent)
+    #         noise_img.save(f"noise.png", "PNG")
+    #         # plt.imshow(mixed_noise.detach().cpu().numpy()[0], cmap='viridis')
+    #         # plt.colorbar()
+    #         # plt.title('Tensor Visualization')
+    #         #
+    #         # # Save the plot as a PNG file
+    #         # plt.savefig('tensor_plot.png')
+    #         #
+    #         # # Display the plot
+    #         # plt.show()
+    #
+    #
+    #         # NOTE: Since the variance of the Gaussian noise in mixed_noise has changed, it must be corrected through scaling.
+    #         # scale_factor = math.sqrt((1 - strength) ** 2 + strength ** 2)
+    #         # corrected_noise = mixed_noise / scale_factor
+    #
+    #         return mixed_noise
+    #
+    # # method: incremental seed batch noise
+    # if noise_inds is None and incremental_seed_mode == "incremental":
+    #     batch_cnt = latent_size[0]
+    #
+    #     latents = None
+    #     for i in range(batch_cnt):
+    #         if noise_device == "cpu":
+    #             generator = torch.manual_seed(seed+i)
+    #         else:
+    #             torch.cuda.manual_seed(seed+i)
+    #             generator = None
+    #
+    #         latent = torch.randn(latent_size_1batch, dtype=latent_image.dtype, layout=latent_image.layout,
+    #                              generator=generator, device=noise_device)
+    #
+    #         latent = apply_variation(latent)
+    #
+    #         if latents is None:
+    #             latents = latent
+    #         else:
+    #             latents = torch.cat((latents, latent), dim=0)
+    #
+    #     return latents
+    #
+    # # method: incremental variation batch noise
+    # elif noise_inds is None and incremental_seed_mode.startswith("variation str inc"):
+    #     batch_cnt = latent_size[0]
+    #
+    #     latents = None
+    #     for i in range(batch_cnt):
+    #         if noise_device == "cpu":
+    #             generator = torch.manual_seed(seed)
+    #         else:
+    #             torch.cuda.manual_seed(seed)
+    #             generator = None
+    #
+    #         latent = torch.randn(latent_size_1batch, dtype=latent_image.dtype, layout=latent_image.layout,
+    #                              generator=generator, device=noise_device)
+    #
+    #         step = float(incremental_seed_mode[18:])
+    #         latent = apply_variation(latent, step*i)
+    #
+    #         if latents is None:
+    #             latents = latent
+    #         else:
+    #             latents = torch.cat((latents, latent), dim=0)
+    #
+    #     return latents
+    #
+    # # method: comfy batch noise
+    # if noise_device == "cpu":
+    #     generator = torch.manual_seed(seed)
+    # else:
+    #     torch.cuda.manual_seed(seed)
+    #     generator = None
+    #
+    # if noise_inds is None:
+    #     latents = torch.randn(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout,
+    #                           generator=generator, device=noise_device)
+    #     latents = apply_variation(latents)
+    #     return latents
+    #
+    # unique_inds, inverse = np.unique(noise_inds, return_inverse=True)
+    # noises = []
+    # for i in range(unique_inds[-1] + 1):
+    #     noise = torch.randn([1] + list(latent_image.size())[1:], dtype=latent_image.dtype, layout=latent_image.layout,
+    #                         generator=generator, device=noise_device)
+    #     if i in unique_inds:
+    #         noises.append(noise)
+    # noises = [noises[i] for i in inverse]
+    # noises = torch.cat(noises, axis=0)
+    # return noises
 
 
 def pil2tensor(image):
